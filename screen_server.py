@@ -23,27 +23,43 @@ socketio = SocketIO(app,
 streaming = True
 frame_count = 0
 frame_lock = Lock()
-frame_queue = queue.Queue(maxsize=3)  # Increased queue size slightly
+frame_queue = queue.Queue(maxsize=2)  # Smaller queue for more consistent timing
 current_fps = 0
 last_emit_time = 0
+fps_history = []  # Store recent FPS values for smoothing
+MAX_FPS_HISTORY = 10  # Number of samples to keep for moving average
 def calculate_fps():
-    global streaming, frame_count, current_fps, last_emit_time
-    min_emit_interval = 0.2  # Minimum time between FPS updates (200ms)
+    global streaming, frame_count, current_fps, last_emit_time, fps_history
+    min_emit_interval = 0.1  # More frequent updates (100ms)
+    sample_interval = 0.2    # Sample FPS every 200ms
     
     while streaming:
         try:
             with frame_lock:
                 last_count = frame_count
-            time.sleep(0.5)  # Calculate more frequently
+            
+            time.sleep(sample_interval)
             
             with frame_lock:
                 current_time = time.time()
                 elapsed = current_time - last_emit_time
-                new_fps = (frame_count - last_count) * 2  # Multiply by 2 since we sleep 0.5s
                 
-                if new_fps >= 0:  # Avoid negative FPS
-                    current_fps = new_fps
-                    frame_count = last_count  # Don't reset to 0, just update baseline
+                # Calculate instantaneous FPS
+                new_fps = (frame_count - last_count) * (1.0 / sample_interval)
+                frame_count = last_count  # Update baseline without resetting
+                
+                if new_fps >= 0:
+                    # Update moving average
+                    fps_history.append(new_fps)
+                    if len(fps_history) > MAX_FPS_HISTORY:
+                        fps_history.pop(0)
+                    
+                    # Calculate smoothed FPS
+                    if fps_history:
+                        # Remove outliers before averaging
+                        sorted_fps = sorted(fps_history)
+                        trimmed_fps = sorted_fps[1:-1] if len(sorted_fps) > 3 else sorted_fps
+                        current_fps = round(sum(trimmed_fps) / len(trimmed_fps))
                 
                 # Emit FPS update if enough time has passed
                 if elapsed >= min_emit_interval:
@@ -57,18 +73,32 @@ def calculate_fps():
 
 def capture_screen():
     global streaming, frame_count
+    target_fps = 30  # Target more stable 30 FPS
+    target_delay = 1.0 / target_fps
+    frame_time_buffer = []  # Keep track of frame times for adaptive timing
+    MAX_TIMING_SAMPLES = 5
+
     last_capture_time = time.time()
-    target_delay = 1.0 / 60  # Target 60 FPS
 
     while streaming:
         try:
             current_time = time.time()
             elapsed = current_time - last_capture_time
-            
-            if elapsed < target_delay:
-                # Skip this frame if we're running too fast
-                time.sleep(target_delay - elapsed)
+
+            # Adaptive timing based on recent frame times
+            if frame_time_buffer:
+                avg_frame_time = sum(frame_time_buffer) / len(frame_time_buffer)
+                # Adjust delay based on average frame processing time
+                adjusted_delay = max(0, target_delay - (avg_frame_time * 0.5))
+            else:
+                adjusted_delay = target_delay
+
+            if elapsed < adjusted_delay:
+                # Fine-grained sleep for more accurate timing
+                time.sleep(max(0, adjusted_delay - elapsed))
                 continue
+
+            capture_start = time.time()
 
             # Capture screenshot
             screenshot = pyautogui.screenshot()
@@ -76,35 +106,37 @@ def capture_screen():
             # Rotate image 90 degrees
             rotated = screenshot.rotate(270, expand=True)
             
-            # Reduce size by 50% for better performance
+            # Reduce size by 66% for more stable performance
             width, height = rotated.size
-            rotated = rotated.resize((width // 2, height // 2), Image.Resampling.LANCZOS)
+            new_width = width * 2 // 3
+            new_height = height * 2 // 3
+            rotated = rotated.resize((new_width, new_height), Image.Resampling.LANCZOS)
             
-            # Convert to bytes with lower quality for faster transmission
+            # Convert to bytes with consistent quality
             img_byte_arr = io.BytesIO()
-            rotated.save(img_byte_arr, format='JPEG', quality=35)  # Lower quality for better performance
+            rotated.save(img_byte_arr, format='JPEG', quality=30)  # Slightly lower quality for stability
             img_byte_arr = img_byte_arr.getvalue()
             
             # Convert to base64 for sending
             base64_frame = base64.b64encode(img_byte_arr).decode('utf-8')
             
-            try:
-                # Try to add frame to queue without blocking
+            # Update timing information
+            frame_time = time.time() - capture_start
+            frame_time_buffer.append(frame_time)
+            if len(frame_time_buffer) > MAX_TIMING_SAMPLES:
+                frame_time_buffer.pop(0)
+
+            if not frame_queue.full():
                 frame_queue.put_nowait(base64_frame)
-                
-                # Update frame counter thread-safely
                 with frame_lock:
                     frame_count += 1
-                    
-                last_capture_time = current_time
-                
-            except queue.Full:
-                # Skip frame if queue is full
-                pass
-                
+            
+            last_capture_time = current_time
+
         except Exception as e:
             print(f"Error capturing screen: {e}")
             time.sleep(0.1)
+            frame_time_buffer.clear()  # Reset timing buffer on error
 
 @app.route('/')
 def index():
@@ -239,39 +271,65 @@ def index():
 
 def send_frames():
     global streaming
+    target_interval = 1.0 / 30  # Match capture FPS
+    min_interval = target_interval * 0.8  # Allow slight speedup if needed
     last_frame_time = time.time()
-    min_frame_interval = 1.0 / 60  # Target 60 FPS max
     consecutive_errors = 0
+    frame_times = []  # Track recent frame send times
+    MAX_FRAME_TIMES = 5
     
     while streaming:
         try:
             current_time = time.time()
             elapsed = current_time - last_frame_time
             
-            if elapsed < min_frame_interval:
-                # Wait for minimum interval to maintain consistent frame rate
-                time.sleep(min_frame_interval - elapsed)
-                continue
-                
-            # Get frame from queue with short timeout
-            frame = frame_queue.get(timeout=0.1)
+            # Adaptive timing based on recent frame times
+            if frame_times:
+                avg_frame_time = sum(frame_times) / len(frame_times)
+                adjusted_interval = min(target_interval, max(min_interval, avg_frame_time * 1.1))
+            else:
+                adjusted_interval = target_interval
             
-            # Emit frame and track timing
+            if elapsed < adjusted_interval:
+                time.sleep(min(adjusted_interval - elapsed, 0.016))  # Max 16ms sleep
+                continue
+            
+            # Get frame with shorter timeout
+            frame = frame_queue.get(timeout=0.05)  # Faster response to available frames
+            
+            # Track frame send time
+            send_start = time.time()
             socketio.emit('screen_frame', {'frame': frame})
-            last_frame_time = time.time()
-            consecutive_errors = 0  # Reset error counter on success
+            
+            # Update timing information
+            frame_time = time.time() - send_start
+            frame_times.append(frame_time)
+            if len(frame_times) > MAX_FRAME_TIMES:
+                frame_times.pop(0)
+            
+            last_frame_time = current_time
+            consecutive_errors = 0
             
         except queue.Empty:
-            # No frames available, just continue
+            if time.time() - last_frame_time > 1.0:  # Reset timing after long gaps
+                last_frame_time = time.time()
+                frame_times.clear()
             continue
             
         except Exception as e:
             print(f"Error sending frame: {e}")
             consecutive_errors += 1
+            frame_times.clear()  # Reset timing on error
             
-            # Add increasing delay on repeated errors
             if consecutive_errors > 3:
                 time.sleep(min(0.5, 0.1 * consecutive_errors))
+                if consecutive_errors > 5:
+                    # Clear queue if too many errors
+                    while not frame_queue.empty():
+                        try:
+                            frame_queue.get_nowait()
+                        except queue.Empty:
+                            break
             else:
                 time.sleep(0.1)
 
